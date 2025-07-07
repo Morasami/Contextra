@@ -1,0 +1,150 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: contextra-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-contextra}
+      POSTGRES_USER: ${POSTGRES_USER:-contextra_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-contextra_pass}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d
+    networks:
+      - contextra-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-contextra_user} -d ${POSTGRES_DB:-contextra}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Weaviate Vector Database
+  weaviate:
+    image: semitechnologies/weaviate:1.22.4
+    container_name: contextra-weaviate
+    restart: on-failure:0
+    ports:
+      - "${WEAVIATE_PORT:-8080}:8080"
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+      DEFAULT_VECTORIZER_MODULE: 'none'
+      ENABLE_MODULES: 'text2vec-transformers'
+      CLUSTER_HOSTNAME: 'node1'
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    networks:
+      - contextra-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=3", "--spider", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for Celery (Background Processing)
+  redis:
+    image: redis:7-alpine
+    container_name: contextra-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - contextra-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MCP Memory Server
+  mcp-memory-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: contextra-mcp-server
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+    environment:
+      # Database Configuration
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-contextra}
+      POSTGRES_USER: ${POSTGRES_USER:-contextra_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-contextra_pass}
+      
+      # Weaviate Configuration
+      WEAVIATE_URL: http://weaviate:8080
+      
+      # Redis Configuration
+      REDIS_URL: redis://redis:6379/0
+      
+      # MCP Server Configuration
+      MCP_DEBUG: ${MCP_DEBUG:-false}
+      ENABLE_AUTO_SYNTHESIS: ${ENABLE_AUTO_SYNTHESIS:-true}
+      DEFAULT_EMBEDDING_MODEL: ${DEFAULT_EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      MAX_SEARCH_RESULTS: ${MAX_SEARCH_RESULTS:-10}
+      
+      # Lightweight mode (set to true to use SQLite + ChromaDB)
+      LIGHTWEIGHT_MODE: ${LIGHTWEIGHT_MODE:-false}
+    volumes:
+      - ./data:/app/data  # For SQLite and ChromaDB in lightweight mode
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      weaviate:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - contextra-network
+    restart: unless-stopped
+
+  # Celery Worker for Background Processing
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: contextra-celery-worker
+    command: celery -A mcp_memory_server.services.celery_app worker --loglevel=info
+    environment:
+      # Same environment as mcp-memory-server
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-contextra}
+      POSTGRES_USER: ${POSTGRES_USER:-contextra_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-contextra_pass}
+      WEAVIATE_URL: http://weaviate:8080
+      REDIS_URL: redis://redis:6379/0
+      MCP_DEBUG: ${MCP_DEBUG:-false}
+      ENABLE_AUTO_SYNTHESIS: ${ENABLE_AUTO_SYNTHESIS:-true}
+      DEFAULT_EMBEDDING_MODEL: ${DEFAULT_EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      LIGHTWEIGHT_MODE: ${LIGHTWEIGHT_MODE:-false}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      weaviate:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - contextra-network
+    restart: unless-stopped
+
+networks:
+  contextra-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  weaviate_data:
+  redis_data:
